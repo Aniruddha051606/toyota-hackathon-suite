@@ -1,201 +1,242 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import io
-from scipy.io.wavfile import write as write_wav
 
-# --- Page Config ---
-st.set_page_config(
-    page_title="Post-Event Analysis",
-    page_icon="📊",
-    layout="wide"
-)
-
-# --- Data Loading Function ---
-@st.cache_data  # Cache the heavy data processing
-def load_all_lap_data(csv_file_path, 
-                      lap_reset_threshold_meters=-3000, 
-                      min_lap_time_seconds=60):
-    """
-    Loads and processes the entire race file to extract all valid lap times.
-    """
+# --- Helper Function to Load and Prepare Data ---
+@st.cache_data  # This decorator caches the data so it only loads once
+def load_and_prepare_data(ghost_path, live_path):
     try:
-        cols_to_use = ['timestamp', 'telemetry_name', 'telemetry_value']
-        df = pd.read_csv(csv_file_path, usecols=cols_to_use)
-
-        df_wide = df.pivot_table(index='timestamp', 
-                                 columns='telemetry_name', 
-                                 values='telemetry_value',
-                                 aggfunc='mean').reset_index()
-
-        df_wide['timestamp_dt'] = pd.to_datetime(df_wide['timestamp'], errors='coerce')
-        df_wide = df_wide.sort_values(by='timestamp_dt')
-        df_wide['time_sec'] = (df_wide['timestamp_dt'].astype(int) / 10**9)
-
-        telemetry_cols = ['Laptrigger_lapdist_dls'] # Only need this for lap detection
+        ghost_df = pd.read_csv(ghost_path)
+        live_df = pd.read_csv(live_path)
         
-        for col in telemetry_cols:
-            if col in df_wide.columns:
-                df_wide[col] = pd.to_numeric(df_wide[col], errors='coerce')
-
-        df_wide[telemetry_cols] = df_wide[telemetry_cols].ffill()
-        df_valid = df_wide.dropna(subset=['time_sec', 'Laptrigger_lapdist_dls']).copy()
-
-        df_valid['dist_diff'] = df_valid['Laptrigger_lapdist_dls'].diff()
-        lap_crossings = df_valid[df_valid['dist_diff'] < lap_reset_threshold_meters]
-        crossing_timestamps_sec = lap_crossings['time_sec'].values
+        ghost_base_time = ghost_df['lap_timestamp'].max()
         
-        if len(crossing_timestamps_sec) < 2:
-            st.error("Not enough lap crossings detected to analyze.")
-            return None
+        telemetry_cols = [
+            'lap_timestamp', 'speed', 'nmot', 'aps', 'gear', 
+            'Steering_Angle', 'pbrake_f', 'pbrake_r',
+            'VBOX_Lat_Min', 'VBOX_Long_Minutes', 'Laptrigger_lapdist_dls'
+        ]
+        
+        ghost_df['lap_timestamp'] = pd.to_timedelta(ghost_df['lap_timestamp'], unit='s')
+        live_df['lap_timestamp'] = pd.to_timedelta(live_df['lap_timestamp'], unit='s')
+        
+        ghost_df = ghost_df.set_index('lap_timestamp')
+        live_df = live_df.set_index('lap_timestamp')
+        
+        ghost_df = ghost_df.reindex(columns=telemetry_cols[1:])
+        live_df = live_df.reindex(columns=telemetry_cols[1:])
+        
+        rule = '0.01S' # 10ms resampling
+        
+        combined_index = pd.to_timedelta(np.arange(
+            0, 
+            max(ghost_df.index.max().total_seconds(), live_df.index.max().total_seconds()), 
+            0.01
+        ), unit='s')
+        
+        ghost_resampled = ghost_df.reindex(ghost_df.index.union(combined_index)).interpolate('time').reindex(combined_index)
+        live_resampled = live_df.reindex(live_df.index.union(combined_index)).interpolate('time').reindex(combined_index)
+        
+        ghost_resampled = ghost_resampled.ffill().bfill()
+        live_resampled = live_resampled.ffill().bfill()
+        
+        live_resampled['delta'] = (live_resampled['speed'] - ghost_resampled['speed']) / 3600 * 0.01
+        live_resampled['time_delta_cumulative'] = live_resampled['delta'].cumsum()
 
-        lap_durations = np.diff(crossing_timestamps_sec)
-        valid_laps_mask = lap_durations > min_lap_time_seconds
+        # --- NEW: SECTOR-BY-SECTOR ANALYSIS ---
+        # Use the values from your inspector script
+        bins = [4.0, 1216.0, 1608.0, 1943.0, 3699.0]
+        labels = ["Sector 1", "Sector 2", "Sector 3", "Sector 4"]
         
-        if not np.any(valid_laps_mask):
-            st.error(f"No valid laps found with a duration > {min_lap_time_seconds}s.")
-            return None
-            
-        valid_lap_durations = lap_durations[valid_laps_mask]
+        # Assign each row to a sector
+        ghost_resampled['sector'] = pd.cut(ghost_resampled['Laptrigger_lapdist_dls'], bins=bins, labels=labels, right=True)
+        live_resampled['sector'] = pd.cut(live_resampled['Laptrigger_lapdist_dls'], bins=bins, labels=labels, right=True)
         
-        # Add a "Lap Number"
-        lap_data = pd.DataFrame({
-            'Lap Number': range(1, len(valid_lap_durations) + 1),
-            'Lap Time (s)': valid_lap_durations
+        # Fill any gaps (e.g., at the start)
+        ghost_resampled['sector'] = ghost_resampled['sector'].ffill().bfill()
+        live_resampled['sector'] = live_resampled['sector'].ffill().bfill()
+
+        # Calculate time spent in each sector (each row is 0.01s)
+        ghost_sector_times = ghost_resampled.groupby('sector').apply(len) * 0.01
+        live_sector_times = live_resampled.groupby('sector').apply(len) * 0.01
+        
+        # Create the analysis DataFrame
+        sector_analysis_df = pd.DataFrame({
+            'Ghost Time (s)': ghost_sector_times,
+            'Live Time (s)': live_sector_times
         })
-        
-        return lap_data
+        sector_analysis_df['Delta (s)'] = sector_analysis_df['Live Time (s)'] - sector_analysis_df['Ghost Time (s)']
+        sector_analysis_df = sector_analysis_df.dropna()
+        # --- END NEW SECTOR ANALYSIS ---
 
+        return ghost_resampled, live_resampled, sector_analysis_df, ghost_base_time
+    
     except FileNotFoundError:
-        st.error(f"Error: Main data file not found at {csv_file_path}")
-        return None
+        st.error(f"Error: Make sure 'ghost_lap.csv' and 'live_lap.csv' are in the same folder.")
+        return None, None, None, None
     except Exception as e:
         st.error(f"An error occurred during data processing: {e}")
-        return None
+        return None, None, None, None
 
-# --- NEW: AUDIO GENERATION FUNCTION ---
-@st.cache_data # Cache the audio file once it's generated
-def generate_lap_audio(lap_csv_path):
-    """
-    Generates an audio representation of a lap using RPM for pitch
-    and Throttle for volume. This is 'Telemetry Sonification'.
-    """
+
+# --- Main Application ---
+st.title("🚗 Real-Time Driver Coach")
+st.markdown("Comparing the **Fastest Lap** (Ghost) vs. the **Average Lap** (Live Driver)")
+
+# Load the data
+ghost, live, sector_analysis, ghost_lap_time = load_and_prepare_data("ghost_lap.csv", "live_lap.csv")
+
+if ghost is not None and live is not None:
+    
+    total_time_sec = live.index.max().total_seconds()
+    
+    st.subheader("Race Time Simulator")
+    current_time = st.slider(
+        "Scrub through the lap (in seconds):", 
+        min_value=0.0, 
+        max_value=total_time_sec, 
+        value=0.0, 
+        step=0.1
+    )
+    
+    current_time_td = pd.to_timedelta(current_time, unit='s')
     try:
-        df = pd.read_csv(lap_csv_path)
-        
-        # Prepare RPM data (for pitch)
-        rpm = df['nmot'].fillna(2000) # Fill gaps with idle RPM
-        min_rpm, max_rpm = 2000, 8000 # Guesses for engine range
-        min_freq, max_freq = 150, 600 # Pitch range (in Hz)
-        # Normalize RPM to 0-1 range
-        rpm_normalized = (rpm - min_rpm) / (max_rpm - min_rpm)
-        # Map to frequency range
-        frequency = (rpm_normalized * (max_freq - min_freq)) + min_freq
-        
-        # Prepare Throttle data (for volume)
-        throttle = df['aps'].fillna(0) / 100.0 # Normalize 0-100 to 0-1
-        
-        # Prepare time data
-        sample_rate = 44100
-        time = df['lap_timestamp']
-        duration = time.max()
-        
-        # Create an evenly-spaced time array for the audio signal
-        t_audio = np.linspace(0., duration, int(sample_rate * duration), endpoint=False)
-        
-        # Interpolate our data to match the new audio time array
-        frequency_interp = np.interp(t_audio, time, frequency)
-        throttle_interp = np.interp(t_audio, time, throttle)
+        ghost_now = ghost.loc[current_time_td]
+        live_now = live.loc[current_time_td]
+    except KeyError:
+        # Fallback for slider precision
+        ghost_now = ghost.iloc[ghost.index.get_loc(current_time_td, method='nearest')]
+        live_now = live.iloc[live.index.get_loc(current_time_td, method='nearest')]
 
-        # Generate the audio wave
-        # Create the phase by integrating frequency (rpm)
-        phase = np.cumsum(2 * np.pi * frequency_interp / sample_rate)
-        # Create the signal by multiplying the wave by amplitude (throttle)
-        signal = (throttle_interp * np.sin(phase)).astype(np.float32)
+    time_delta = live_now['time_delta_cumulative']
+    
+    # --- UPGRADED TOP SECTION ---
+    col_delta, col_projection, col_insight = st.columns([1, 1, 2])
+    
+    with col_delta:
+        st.header(f"Time Delta:")
+        st.header(f"{time_delta:+.3f}s")
+        if time_delta > 0:
+            st.error("🔴 **SLOWER**")
+        else:
+            st.success("🟢 **FASTER**")
+
+    with col_projection:
+        projected_lap_time = ghost_lap_time + time_delta
+        st.header("Projected Lap:")
+        st.header(f"{projected_lap_time:.3f}s")
+        st.caption(f"Ghost Lap Time: {ghost_lap_time:.3f}s")
+    
+    # --- UPGRADED: ACTIONABLE INSIGHT (SECTOR-AWARE) ---
+    with col_insight:
+        st.subheader("💡 Actionable Insight")
         
-        # Normalize to 16-bit audio range
-        signal_normalized = np.int16(signal / np.max(np.abs(signal)) * 32767)
+        # Get current sector
+        current_sector = live_now['sector']
         
-        # Save to an in-memory buffer
-        buffer = io.BytesIO()
-        write_wav(buffer, sample_rate, signal_normalized)
-        return buffer.getvalue()
-        
-    except Exception as e:
-        st.error(f"Could not generate audio: {e}")
-        return None
-# --- END NEW FUNCTION ---
+        if pd.isna(current_sector):
+            st.info("Driving...")
+        else:
+            sector_delta = sector_analysis.loc[current_sector]['Delta (s)']
+            
+            # High-level sector insight
+            if sector_delta > 0.1:
+                st.warning(f"**Losing {sector_delta:.2f}s in {current_sector}.**")
+            elif sector_delta < -0.1:
+                st.success(f"**Gaining {sector_delta:.2f}s in {current_sector}!**")
+            else:
+                st.info(f"Pace is matching the ghost in {current_sector}.")
 
-
-# --- Main Page Layout ---
-st.title("📊 Post-Event Analysis")
-st.markdown("Analyzing every lap from the race to find key moments and driver consistency.")
-
-csv_path = r"C:\Users\Aniruddha\Downloads\barber-motorsports-park\barber\R1_barber_telemetry_data.csv"
-all_laps = load_all_lap_data(csv_path)
-
-if all_laps is not None:
-    # --- Key Statistics ---
-    st.subheader("Race Summary Statistics")
-    
-    fastest_lap_time = all_laps['Lap Time (s)'].min()
-    fastest_lap_num = all_laps[all_laps['Lap Time (s)'] == fastest_lap_time]['Lap Number'].values[0]
-    
-    slowest_lap_time = all_laps['Lap Time (s)'].max()
-    slowest_lap_num = all_laps[all_laps['Lap Time (s)'] == slowest_lap_time]['Lap Number'].values[0]
-    
-    avg_lap_time = all_laps['Lap Time (s)'].mean()
-    consistency = all_laps['Lap Time (s)'].std()
-    
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Fastest Lap", f"{fastest_lap_time:.3f}s", f"Lap {fastest_lap_num}")
-    col2.metric("Slowest Lap", f"{slowest_lap_time:.3f}s", f"Lap {slowest_lap_num}")
-    col3.metric("Average Lap", f"{avg_lap_time:.3f}s")
-    col4.metric("Consistency (StdDev)", f"{consistency:+.3f}s", "Lower is better")
-    
+            # Low-level instant insight
+            live_brake = 'pbrake_f' in live_now and live_now['pbrake_f'] > 5
+            ghost_brake = 'pbrake_f' in ghost_now and ghost_now['pbrake_f'] > 5
+            
+            if live_brake and not ghost_brake:
+                st.markdown("*Instant Feedback:* You are braking, but the ghost is not.")
+            elif not live_brake and ghost_brake:
+                st.markdown("*Instant Feedback:* Ghost is braking, but you are not.")
+            elif live_now['aps'] < 90 and ghost_now['aps'] > 90:
+                st.markdown("*Instant Feedback:* Ghost is full throttle, but you are not.")
+            elif live_now['speed'] < (ghost_now['speed'] - 5):
+                st.markdown(f"*Instant Feedback:* Speed is {ghost_now['speed'] - live_now['speed']:.0f} km/h slower.")
+    # --- END UPGRADED INSIGHT ---
+            
     st.divider()
-    
-    # --- NEW: THE RACE STORY ---
-    st.subheader("📖 The Story of the Race")
-    
-    st.markdown(f"* **The Hero Lap:** Lap **{fastest_lap_num}** was the fastest at **{fastest_lap_time:.3f}s**.")
-    st.markdown(f"* **The Problem Lap:** Lap **{slowest_lap_num}** was the slowest at **{slowest_lap_time:.3f}s**, a **{slowest_lap_time - fastest_lap_time:.3f}s** difference.")
-    
-    # Analyze a mid-race stint
-    stint_start, stint_end = 5, 10
-    stint_laps = all_laps[(all_laps['Lap Number'] >= stint_start) & (all_laps['Lap Number'] <= stint_end)]
-    if not stint_laps.empty:
-        stint_std = stint_laps['Lap Time (s)'].std()
-        st.markdown(f"* **Consistent Stint:** Laps {stint_start}-{stint_end} were highly consistent, with times varying by only {stint_std:.3f}s (Std. Dev).")
-    
-    # Analyze tire degradation at the end
-    final_laps = all_laps.tail(5)
-    if len(final_laps) > 1:
-        degradation = final_laps['Lap Time (s)'].diff().mean()
-        if degradation > 0.1:
-            st.markdown(f"* **Tire Wear:** In the final {len(final_laps)} laps, a clear degradation pattern emerged, with times increasing by an average of **{degradation:.3f}s** per lap.")
-    # --- END NEW SECTION ---
+
+    # --- LIVE TRACK MAP ---
+    st.subheader("🛰️ Live Track Position")
+    map_data = pd.DataFrame({
+        'lat': [ghost_now['VBOX_Lat_Min'], live_now['VBOX_Lat_Min']],
+        'lon': [ghost_now['VBOX_Long_Minutes'], live_now['VBOX_Long_Minutes']]
+    })
+    map_data = map_data.dropna()
+    if not map_data.empty:
+        st.map(map_data, zoom=15, use_container_width=True) 
+    else:
+        st.warning("GPS data not available for this timestamp.")
 
     st.divider()
     
-    # --- Lap Time Chart ---
-    st.subheader("Lap Time Consistency")
-    st.markdown("This chart shows your lap time over the entire race. Look for a stable, flat line.")
-    chart_data = all_laps.set_index('Lap Number')
-    st.line_chart(chart_data['Lap Time (s)'])
+    # --- LIVE TELEMETRY WITH VISUALS ---
+    st.subheader("Live Telemetry Comparison")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("👻 Ghost (Fastest Lap)")
+        g_col1, g_col2 = st.columns(2)
+        g_col1.metric("Speed (km/h)", f"{ghost_now['speed']:.1f}")
+        g_col2.metric("RPM", f"{ghost_now['nmot']:.0f}")
+        g_col1.metric("Steering", f"{ghost_now['Steering_Angle']:.1f}°")
+        g_col2.metric("Gear", f"{ghost_now['gear']:.0f}")
+        
+        st.text("Throttle:")
+        st.progress(int(ghost_now['aps']))
+        st.text("Brake (Front):")
+        st.progress(int(ghost_now['pbrake_f']) if 'pbrake_f' in ghost_now and pd.notna(ghost_now['pbrake_f']) else 0)
 
+
+    with col2:
+        st.subheader("🚗 Live Driver (Average Lap)")
+        l_col1, l_col2 = st.columns(2)
+        l_col1.metric("Speed (km/h)", f"{live_now['speed']:.1f}")
+        l_col2.metric("RPM", f"{live_now['nmot']:.0f}")
+        l_col1.metric("Steering", f"{live_now['Steering_Angle']:.1f}°")
+        l_col2.metric("Gear", f"{live_now['gear']:.0f}")
+
+        st.text("Throttle:")
+        st.progress(int(live_now['aps']))
+        st.text("Brake (Front):")
+        st.progress(int(live_now['pbrake_f']) if 'pbrake_f' in live_now and pd.notna(live_now['pbrake_f']) else 0)
+        
     st.divider()
+    
+    st.subheader("Full Lap Analysis")
 
+    # --- NEW: SECTOR DELTA BAR CHART ---
+    st.markdown("This chart shows the total time lost or gained in each sector. (Negative = Faster)")
+    st.bar_chart(sector_analysis['Delta (s)'])
+    # --- END NEW CHART ---
+
+    # --- Full Lap Line Charts ---
+    speed_chart_df = pd.DataFrame({
+        'Ghost Lap': ghost['speed'],
+        'Live Lap': live['speed']
+    })
+    speed_chart_df.index = speed_chart_df.index.total_seconds()
+    speed_chart_df.index.name = "Time (s)"
     
-    st.subheader("🎧 Wildcard: Listen to the Lap")
-    st.markdown("Hear the 'song' of the ghost lap. The **pitch is the engine RPM**, and the **volume is the throttle**.")
+    st.line_chart(speed_chart_df, use_container_width=True)
+    st.caption("Speed (km/h) over the full lap (in seconds).")
+
+    throttle_chart_df = pd.DataFrame({
+        'Ghost Lap': ghost['aps'],
+        'Live Lap': live.get('aps', pd.Series(index=live.index, name='aps'))
+    })
+    throttle_chart_df.index = throttle_chart_df.index.total_seconds()
+    throttle_chart_df.index.name = "Time (s)"
     
-    if st.button("Generate Audio for Ghost Lap"):
-        with st.spinner("Sonifying telemetry data... This may take a few moments."):
-            audio_bytes = generate_lap_audio("ghost_lap.csv")
-            if audio_bytes:
-                st.audio(audio_bytes, format="audio/wav")
-    # --- END NEW SECTION ---
+    st.line_chart(throttle_chart_df, use_container_width=True)
+    st.caption("Throttle Application (%) over the full lap (in seconds).")
 
 else:
-    st.info("Processing race data... This may take a moment.")
+    st.info("Waiting for data files... (Make sure 'ghost_lap.csv' and 'live_lap.csv' are in the same folder)")
